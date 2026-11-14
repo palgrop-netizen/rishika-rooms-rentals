@@ -1,0 +1,19 @@
+<resources>
+    <string name="app_name">RRR</string>
+    <string name="app_full_name">Rishika Rooms &amp; Rentals</string>
+    <string name="brand_short">RRR</string>
+    <string name="nav_dashboard">Rooms</string>
+    <string name="nav_payments">Receipts</string>
+    <string name="nav_electricity">Electricity</string>
+    <string name="nav_followups">Follow-Ups</string>
+    <string name="nav_reports">Reports</string>
+    <string name="status_clear">Rent &amp; Electricity Clear</string>
+    <string name="status_vacant">Vacant</string>
+    <string name="action_receive_payment">Payment Received</string>
+    <string name="action_add_tenant">Add Tenant</string>
+    <string name="action_save">Save</string>
+    <string name="action_cancel">Cancel</string>
+    <string name="action_confirm">Confirm</string>
+    <string name="action_delete">Delete</string>
+    <string name="action_edit">Edit</string>
+</resources>

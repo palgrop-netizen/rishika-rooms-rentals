@@ -1,0 +1,6 @@
+{
+  "name": "Rishika Rooms & Rentals",
+  "description": "Property & rental management app for 13 rooms with rent cycles, electricity billing, payment allocation, receipts, advance ledger, follow-ups, reports, and JSON backup.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

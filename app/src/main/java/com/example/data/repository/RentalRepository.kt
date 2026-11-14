@@ -1,0 +1,1312 @@
+package com.example.data.repository
+
+import androidx.room.withTransaction
+import com.example.data.db.AdvanceTransactionEntity
+import com.example.data.db.AppDatabase
+import com.example.data.db.AppSettingsEntity
+import com.example.data.db.BackupHelper
+import com.example.data.db.BackupPayload
+import com.example.data.db.ElectricityBillEntity
+import com.example.data.db.FollowUpEntity
+import com.example.data.db.PaymentAllocationEntity
+import com.example.data.db.PaymentReceiptEntity
+import com.example.data.db.RentEntryEntity
+import com.example.data.db.RoomEntity
+import com.example.data.db.RoomTransferEntity
+import com.example.data.db.SuppressedRentCycleEntity
+import com.example.data.db.TenantEntity
+import com.example.data.db.WriteOffEntity
+import com.example.util.DateUtils
+import com.example.util.MoneyUtils
+import kotlinx.coroutines.flow.Flow
+import java.util.Locale
+
+data class PaymentAllocationPreview(
+    val totalPendingRentPaise: Long,
+    val totalPendingElectricityPaise: Long,
+    val currentAdvancePaise: Long,
+    val rentToSettlePaise: Long,
+    val electricityToSettlePaise: Long,
+    val advanceToAddPaise: Long
+)
+
+class RentalRepository(private val db: AppDatabase) {
+    private val roomDao = db.roomDao()
+    private val tenantDao = db.tenantDao()
+    private val rentDao = db.rentDao()
+    private val electricityDao = db.electricityDao()
+    private val paymentDao = db.paymentDao()
+    private val advanceDao = db.advanceDao()
+    private val writeOffDao = db.writeOffDao()
+    private val followUpDao = db.followUpDao()
+    private val transferDao = db.roomTransferDao()
+    private val settingsDao = db.settingsDao()
+
+    val roomsFlow: Flow<List<RoomEntity>> = roomDao.observeAllRooms()
+    val tenantsFlow: Flow<List<TenantEntity>> = tenantDao.observeAllTenants()
+    val rentEntriesFlow: Flow<List<RentEntryEntity>> = rentDao.observeAllRentEntries()
+    val electricityBillsFlow: Flow<List<ElectricityBillEntity>> = electricityDao.observeAllBills()
+    val receiptsFlow: Flow<List<PaymentReceiptEntity>> = paymentDao.observeAllReceipts()
+    val allocationsFlow: Flow<List<PaymentAllocationEntity>> = paymentDao.observeAllAllocations()
+    val advanceTransactionsFlow: Flow<List<AdvanceTransactionEntity>> = advanceDao.observeAllAdvanceTransactions()
+    val writeOffsFlow: Flow<List<WriteOffEntity>> = writeOffDao.observeAllWriteOffs()
+    val followUpsFlow: Flow<List<FollowUpEntity>> = followUpDao.observeAllFollowUps()
+    val transfersFlow: Flow<List<RoomTransferEntity>> = transferDao.observeAllTransfers()
+    val settingsFlow: Flow<AppSettingsEntity?> = settingsDao.observeSettings()
+
+    suspend fun ensureInitialized(asOfIso: String = DateUtils.todayIso()) {
+        db.withTransaction {
+            if (settingsDao.getSettings() == null) {
+                settingsDao.upsertSettings(AppSettingsEntity())
+            }
+            val existingRooms = roomDao.getAllRooms()
+            if (existingRooms.size < AppDatabase.TOTAL_ROOMS) {
+                val seeds = (1..AppDatabase.TOTAL_ROOMS).map { RoomEntity(roomNumber = it) }
+                roomDao.insertRoomsIgnore(seeds)
+            }
+            generateDueRentLocked(asOfIso)
+        }
+    }
+
+    suspend fun generateDueRentForAllActiveTenants(asOfIso: String = DateUtils.todayIso()): Result<Int> {
+        return runCatching {
+            db.withTransaction {
+                generateDueRentLocked(asOfIso)
+            }
+        }
+    }
+
+    private suspend fun generateDueRentLocked(asOfIso: String): Int {
+        val activeTenants = tenantDao.getActiveTenants()
+        var createdCount = 0
+        for (tenant in activeTenants) {
+            createdCount += generateDueRentForTenantLocked(tenant, asOfIso)
+        }
+        return createdCount
+    }
+
+    private suspend fun generateDueRentForTenantLocked(tenant: TenantEntity, asOfIso: String): Int {
+        val dueCycles = DateUtils.dueCycleIndices(tenant.entryDate, asOfIso)
+        if (dueCycles.isEmpty()) return 0
+        val existingCycles = rentDao.getRentEntriesForTenantAsc(tenant.id)
+            .map { it.cycleIndex }
+            .toSet()
+        val suppressedCycles = rentDao.getSuppressedCyclesForTenant(tenant.id).toSet()
+        var count = 0
+        for (cycle in dueCycles) {
+            if (cycle in existingCycles || cycle in suppressedCycles) continue
+            val dueDate = DateUtils.addMonthsPreservingDay(tenant.entryDate, cycle) ?: continue
+            val entry = RentEntryEntity(
+                tenantId = tenant.id,
+                roomNumber = tenant.currentRoomNumber,
+                cycleIndex = cycle,
+                rentMonth = dueDate.toYearMonth(),
+                dueDate = dueDate.toIso(),
+                rentAmountPaise = tenant.monthlyRentPaise,
+                advanceAppliedPaise = 0L,
+                amountPaidPaise = 0L,
+                writeOffPaise = 0L,
+                pendingPaise = tenant.monthlyRentPaise,
+                status = "PENDING",
+                isAutoGenerated = true
+            )
+            val insertedId = rentDao.insertRentIgnore(entry)
+            if (insertedId > 0L) count++
+        }
+        return count
+    }
+
+    // ==================== TENANTS ====================
+
+    suspend fun addTenant(
+        name: String,
+        mobileNumber: String,
+        roomNumber: Int,
+        monthlyRentPaise: Long,
+        entryDate: String,
+        kycType: String,
+        kycNumber: String,
+        kycDocumentPath: String?,
+        kycDocumentName: String?,
+        notes: String,
+        asOfIso: String = DateUtils.todayIso()
+    ): Result<Long> = runCatching {
+        val cleanName = name.trim()
+        val cleanMobile = mobileNumber.trim()
+        val cleanKycNum = kycNumber.trim()
+        require(cleanName.isNotEmpty()) { "Tenant name is required." }
+        require(cleanMobile.isNotEmpty()) { "Mobile number is required." }
+        require(roomNumber in 1..AppDatabase.TOTAL_ROOMS) { "Select a valid room (1-${AppDatabase.TOTAL_ROOMS})." }
+        require(monthlyRentPaise > 0L) { "Monthly rent must be greater than zero." }
+        require(DateUtils.isValidIsoDate(entryDate)) { "Invalid entry date (expected YYYY-MM-DD)." }
+        require(cleanKycNum.isNotEmpty()) { "Exact KYC document number is required." }
+
+        db.withTransaction {
+            val room = roomDao.getRoom(roomNumber)
+                ?: throw IllegalStateException("Room $roomNumber not found.")
+            if (room.currentTenantId != null) {
+                throw IllegalStateException("Room $roomNumber is already occupied.")
+            }
+
+            val tenant = TenantEntity(
+                name = cleanName,
+                mobileNumber = cleanMobile,
+                currentRoomNumber = roomNumber,
+                monthlyRentPaise = monthlyRentPaise,
+                entryDate = entryDate,
+                kycType = kycType,
+                kycNumber = cleanKycNum,
+                kycDocumentPath = kycDocumentPath,
+                kycDocumentName = kycDocumentName,
+                notes = notes.trim(),
+                advanceBalancePaise = 0L,
+                isActive = true
+            )
+            val tenantId = tenantDao.insertTenant(tenant)
+            roomDao.updateRoom(room.copy(currentTenantId = tenantId))
+            generateDueRentForTenantLocked(tenant.copy(id = tenantId), asOfIso)
+            tenantId
+        }
+    }
+
+    suspend fun editTenant(
+        tenantId: Long,
+        name: String,
+        mobileNumber: String,
+        monthlyRentPaise: Long,
+        entryDate: String,
+        kycType: String,
+        kycNumber: String,
+        kycDocumentPath: String?,
+        kycDocumentName: String?,
+        notes: String
+    ): Result<Unit> = runCatching {
+        val cleanName = name.trim()
+        val cleanMobile = mobileNumber.trim()
+        val cleanKycNum = kycNumber.trim()
+        require(cleanName.isNotEmpty()) { "Tenant name is required." }
+        require(cleanMobile.isNotEmpty()) { "Mobile number is required." }
+        require(monthlyRentPaise > 0L) { "Monthly rent must be greater than zero." }
+        require(DateUtils.isValidIsoDate(entryDate)) { "Invalid entry date (expected YYYY-MM-DD)." }
+        require(cleanKycNum.isNotEmpty()) { "Exact KYC document number is required." }
+
+        db.withTransaction {
+            val existing = tenantDao.getTenantById(tenantId)
+                ?: throw IllegalStateException("Tenant not found.")
+            tenantDao.updateTenant(
+                existing.copy(
+                    name = cleanName,
+                    mobileNumber = cleanMobile,
+                    monthlyRentPaise = monthlyRentPaise,
+                    entryDate = entryDate,
+                    kycType = kycType,
+                    kycNumber = cleanKycNum,
+                    kycDocumentPath = kycDocumentPath,
+                    kycDocumentName = kycDocumentName,
+                    notes = notes.trim()
+                )
+            )
+        }
+    }
+
+    suspend fun transferTenant(
+        tenantId: Long,
+        toRoomNumber: Int,
+        transferDate: String,
+        remarks: String
+    ): Result<Unit> = runCatching {
+        require(toRoomNumber in 1..AppDatabase.TOTAL_ROOMS) { "Invalid destination room." }
+        require(DateUtils.isValidIsoDate(transferDate)) { "Invalid transfer date." }
+
+        db.withTransaction {
+            val tenant = tenantDao.getTenantById(tenantId)
+                ?: throw IllegalStateException("Tenant not found.")
+            require(tenant.isActive) { "Cannot transfer a vacated tenant." }
+            val fromRoomNumber = tenant.currentRoomNumber
+            require(fromRoomNumber != toRoomNumber) { "Tenant is already in Room $toRoomNumber." }
+
+            val fromRoom = roomDao.getRoom(fromRoomNumber)
+                ?: throw IllegalStateException("Source room not found.")
+            val toRoom = roomDao.getRoom(toRoomNumber)
+                ?: throw IllegalStateException("Destination room not found.")
+            if (toRoom.currentTenantId != null) {
+                throw IllegalStateException("Room $toRoomNumber is already occupied.")
+            }
+
+            roomDao.updateRoom(fromRoom.copy(currentTenantId = null))
+            roomDao.updateRoom(toRoom.copy(currentTenantId = tenantId))
+            tenantDao.updateTenant(tenant.copy(currentRoomNumber = toRoomNumber))
+            transferDao.insertTransfer(
+                RoomTransferEntity(
+                    tenantId = tenantId,
+                    fromRoomNumber = fromRoomNumber,
+                    toRoomNumber = toRoomNumber,
+                    transferDate = transferDate,
+                    remarks = remarks.trim()
+                )
+            )
+        }
+    }
+
+    suspend fun vacateTenant(tenantId: Long, vacatedDate: String): Result<Unit> = runCatching {
+        require(DateUtils.isValidIsoDate(vacatedDate)) { "Invalid vacate date." }
+        db.withTransaction {
+            val tenant = tenantDao.getTenantById(tenantId)
+                ?: throw IllegalStateException("Tenant not found.")
+            require(tenant.isActive) { "Tenant is already vacated." }
+            val room = roomDao.getRoom(tenant.currentRoomNumber)
+            if (room != null && room.currentTenantId == tenantId) {
+                roomDao.updateRoom(room.copy(currentTenantId = null))
+            }
+            tenantDao.updateTenant(
+                tenant.copy(
+                    isActive = false,
+                    vacatedDate = vacatedDate
+                )
+            )
+        }
+    }
+
+    suspend fun deleteTenant(tenantId: Long): Result<String?> = runCatching {
+        db.withTransaction {
+            val tenant = tenantDao.getTenantById(tenantId)
+                ?: throw IllegalStateException("Tenant not found.")
+            val rooms = roomDao.getAllRooms()
+            for (room in rooms) {
+                if (room.currentTenantId == tenantId) {
+                    roomDao.updateRoom(room.copy(currentTenantId = null))
+                }
+            }
+            val oldBills = electricityDao.getAllBills().filter { it.tenantId == tenantId }
+            val affectedRooms = oldBills.map { it.roomNumber }.toSet()
+
+            tenantDao.deleteTenantById(tenantId)
+
+            for (roomNum in affectedRooms) {
+                recomputeRoomLastMeterReadingLocked(roomNum)
+            }
+            tenant.kycDocumentPath
+        }
+    }
+
+    // ==================== RENT ENTRIES ====================
+
+    suspend fun addManualRentEntry(
+        tenantId: Long,
+        dueDateIso: String,
+        rentAmountPaise: Long
+    ): Result<Long> = runCatching {
+        val parsed = DateUtils.parseIsoDate(dueDateIso)
+            ?: throw IllegalArgumentException("Invalid due date.")
+        require(rentAmountPaise > 0L) { "Rent amount must be greater than zero." }
+
+        db.withTransaction {
+            val tenant = tenantDao.getTenantById(tenantId)
+                ?: throw IllegalStateException("Tenant not found.")
+            val maxCycle = rentDao.getMaxCycleIndexForTenant(tenantId) ?: 9999
+            val manualCycle = maxOf(maxCycle + 1, 10000)
+            rentDao.insertRentIgnore(
+                RentEntryEntity(
+                    tenantId = tenantId,
+                    roomNumber = tenant.currentRoomNumber,
+                    cycleIndex = manualCycle,
+                    rentMonth = parsed.toYearMonth(),
+                    dueDate = dueDateIso,
+                    rentAmountPaise = rentAmountPaise,
+                    advanceAppliedPaise = 0L,
+                    amountPaidPaise = 0L,
+                    writeOffPaise = 0L,
+                    pendingPaise = rentAmountPaise,
+                    status = "PENDING",
+                    isAutoGenerated = false
+                )
+            )
+        }
+    }
+
+    suspend fun editRentEntry(
+        rentId: Long,
+        newRentAmountPaise: Long,
+        newDueDateIso: String
+    ): Result<Unit> = runCatching {
+        val parsed = DateUtils.parseIsoDate(newDueDateIso)
+            ?: throw IllegalArgumentException("Invalid due date.")
+        require(newRentAmountPaise > 0L) { "Rent amount must be greater than zero." }
+
+        db.withTransaction {
+            val existing = rentDao.getRentById(rentId)
+                ?: throw IllegalStateException("Rent entry not found.")
+            val settled = existing.amountPaidPaise + existing.advanceAppliedPaise + existing.writeOffPaise
+            if (newRentAmountPaise < settled) {
+                throw IllegalArgumentException(
+                    "Rent amount cannot be less than already settled/written-off amount (${MoneyUtils.formatRupees(settled)}). Reverse payments or write-offs first."
+                )
+            }
+            val newPending = newRentAmountPaise - settled
+            val newStatus = computeRentStatus(
+                rentAmountPaise = newRentAmountPaise,
+                amountPaidPaise = existing.amountPaidPaise,
+                advanceAppliedPaise = existing.advanceAppliedPaise,
+                writeOffPaise = existing.writeOffPaise,
+                pendingPaise = newPending
+            )
+            rentDao.updateRentEntry(
+                existing.copy(
+                    rentAmountPaise = newRentAmountPaise,
+                    dueDate = newDueDateIso,
+                    rentMonth = parsed.toYearMonth(),
+                    pendingPaise = newPending,
+                    status = newStatus
+                )
+            )
+        }
+    }
+
+    suspend fun deleteRentEntry(rentId: Long): Result<Unit> = runCatching {
+        db.withTransaction {
+            val existing = rentDao.getRentById(rentId)
+                ?: throw IllegalStateException("Rent entry not found.")
+            if (existing.amountPaidPaise > 0L || existing.advanceAppliedPaise > 0L || existing.writeOffPaise > 0L) {
+                throw IllegalStateException(
+                    "Cannot delete rent entry with linked payments, advance adjustments, or write-offs. Reverse those transactions first."
+                )
+            }
+            rentDao.deleteRentById(rentId)
+            if (existing.isAutoGenerated) {
+                rentDao.insertSuppressedCycle(
+                    SuppressedRentCycleEntity(
+                        tenantId = existing.tenantId,
+                        cycleIndex = existing.cycleIndex,
+                        rentMonth = existing.rentMonth
+                    )
+                )
+            }
+        }
+    }
+
+    // ==================== PAYMENTS & RECEIPTS ====================
+
+    suspend fun previewPaymentAllocation(tenantId: Long, amountPaise: Long): PaymentAllocationPreview {
+        val tenant = tenantDao.getTenantById(tenantId)
+        val pendingRent = rentDao.getPendingRentForTenantAsc(tenantId).sumOf { it.pendingPaise }
+        val pendingElec = electricityDao.getPendingBillsForTenantAsc(tenantId).sumOf { it.pendingPaise }
+        val validAmt = amountPaise.coerceAtLeast(0L)
+        val rentSettle = minOf(validAmt, pendingRent)
+        val afterRent = validAmt - rentSettle
+        val elecSettle = minOf(afterRent, pendingElec)
+        val advAdd = afterRent - elecSettle
+        return PaymentAllocationPreview(
+            totalPendingRentPaise = pendingRent,
+            totalPendingElectricityPaise = pendingElec,
+            currentAdvancePaise = tenant?.advanceBalancePaise ?: 0L,
+            rentToSettlePaise = rentSettle,
+            electricityToSettlePaise = elecSettle,
+            advanceToAddPaise = advAdd
+        )
+    }
+
+    suspend fun receivePayment(
+        tenantId: Long,
+        amountPaise: Long,
+        paymentDate: String,
+        paymentMode: String,
+        remarks: String
+    ): Result<PaymentReceiptEntity> = runCatching {
+        require(amountPaise > 0L) { "Payment amount must be greater than zero." }
+        val parsedDate = DateUtils.parseIsoDate(paymentDate)
+            ?: throw IllegalArgumentException("Invalid payment date.")
+        require(paymentMode.isNotBlank()) { "Payment mode is required." }
+
+        db.withTransaction {
+            val tenant = tenantDao.getTenantById(tenantId)
+                ?: throw IllegalStateException("Tenant not found.")
+            val settings = settingsDao.getSettings() ?: AppSettingsEntity().also {
+                settingsDao.upsertSettings(it)
+            }
+
+            var seq = settings.nextReceiptSeq
+            var receiptNumber = formatReceiptNumber(parsedDate.year, seq)
+            val existingNumbers = paymentDao.getAllReceipts().map { it.receiptNumber }.toSet()
+            while (receiptNumber in existingNumbers) {
+                seq++
+                receiptNumber = formatReceiptNumber(parsedDate.year, seq)
+            }
+            settingsDao.upsertSettings(settings.copy(nextReceiptSeq = seq + 1))
+
+            val initialReceipt = PaymentReceiptEntity(
+                receiptNumber = receiptNumber,
+                tenantId = tenantId,
+                roomNumber = tenant.currentRoomNumber,
+                paymentDate = paymentDate,
+                totalAmountPaise = amountPaise,
+                paymentMode = paymentMode,
+                remarks = remarks.trim()
+            )
+            val paymentId = paymentDao.insertReceipt(initialReceipt)
+
+            var remaining = amountPaise
+            var totalRentSettled = 0L
+            var totalElecSettled = 0L
+            var advanceAdded = 0L
+
+            // Priority 1: Oldest Rent Pending
+            val pendingRents = rentDao.getPendingRentForTenantAsc(tenantId)
+            for (rent in pendingRents) {
+                if (remaining <= 0L) break
+                val allocate = minOf(remaining, rent.pendingPaise)
+                if (allocate > 0L) {
+                    val newPaid = rent.amountPaidPaise + allocate
+                    val newPending = rent.pendingPaise - allocate
+                    val newStatus = computeRentStatus(
+                        rent.rentAmountPaise,
+                        newPaid,
+                        rent.advanceAppliedPaise,
+                        rent.writeOffPaise,
+                        newPending
+                    )
+                    rentDao.updateRentEntry(
+                        rent.copy(
+                            amountPaidPaise = newPaid,
+                            pendingPaise = newPending,
+                            status = newStatus
+                        )
+                    )
+                    paymentDao.insertAllocation(
+                        PaymentAllocationEntity(
+                            paymentId = paymentId,
+                            tenantId = tenantId,
+                            targetType = "RENT",
+                            targetId = rent.id,
+                            amountPaise = allocate
+                        )
+                    )
+                    remaining -= allocate
+                    totalRentSettled += allocate
+                }
+            }
+
+            // Priority 2: Oldest Electricity Bills Pending
+            if (remaining > 0L) {
+                val pendingBills = electricityDao.getPendingBillsForTenantAsc(tenantId)
+                for (bill in pendingBills) {
+                    if (remaining <= 0L) break
+                    val allocate = minOf(remaining, bill.pendingPaise)
+                    if (allocate > 0L) {
+                        val newPaid = bill.amountPaidPaise + allocate
+                        val newPending = bill.pendingPaise - allocate
+                        val newStatus = computeBillStatus(bill.totalBillPaise, newPaid)
+                        electricityDao.updateBill(
+                            bill.copy(
+                                amountPaidPaise = newPaid,
+                                pendingPaise = newPending,
+                                status = newStatus
+                            )
+                        )
+                        paymentDao.insertAllocation(
+                            PaymentAllocationEntity(
+                                paymentId = paymentId,
+                                tenantId = tenantId,
+                                targetType = "ELECTRICITY",
+                                targetId = bill.id,
+                                amountPaise = allocate
+                            )
+                        )
+                        remaining -= allocate
+                        totalElecSettled += allocate
+                    }
+                }
+            }
+
+            // Priority 3: Advance / Credit Balance
+            if (remaining > 0L) {
+                advanceAdded = remaining
+                val updatedTenant = tenant.copy(advanceBalancePaise = tenant.advanceBalancePaise + advanceAdded)
+                tenantDao.updateTenant(updatedTenant)
+                val advTxId = advanceDao.insertAdvanceTransaction(
+                    AdvanceTransactionEntity(
+                        tenantId = tenantId,
+                        type = "ADDED_FROM_PAYMENT",
+                        amountPaise = advanceAdded,
+                        paymentId = paymentId,
+                        transactionDate = paymentDate,
+                        remarks = "Excess from receipt $receiptNumber"
+                    )
+                )
+                paymentDao.insertAllocation(
+                    PaymentAllocationEntity(
+                        paymentId = paymentId,
+                        tenantId = tenantId,
+                        targetType = "ADVANCE",
+                        targetId = advTxId,
+                        amountPaise = advanceAdded
+                    )
+                )
+            }
+
+            val finalReceipt = initialReceipt.copy(
+                id = paymentId,
+                rentAdjustedPaise = totalRentSettled,
+                electricityAdjustedPaise = totalElecSettled,
+                advanceAddedPaise = advanceAdded
+            )
+            paymentDao.updateReceipt(finalReceipt)
+            finalReceipt
+        }
+    }
+
+    suspend fun deleteReceipt(paymentId: Long): Result<Unit> = runCatching {
+        db.withTransaction {
+            val receipt = paymentDao.getReceiptById(paymentId)
+                ?: throw IllegalStateException("Receipt not found.")
+            var tenant = tenantDao.getTenantById(receipt.tenantId)
+                ?: throw IllegalStateException("Tenant not found.")
+            val allocations = paymentDao.getAllocationsForPayment(paymentId)
+
+            // 1. Reconcile Advance if this payment added Advance/Credit
+            if (receipt.advanceAddedPaise > 0L) {
+                if (tenant.advanceBalancePaise >= receipt.advanceAddedPaise) {
+                    tenant = tenant.copy(
+                        advanceBalancePaise = tenant.advanceBalancePaise - receipt.advanceAddedPaise
+                    )
+                    tenantDao.updateTenant(tenant)
+                } else {
+                    // Part of the advance was already adjusted to future rent; reverse dependent ADJUSTED_TO_RENT LIFO
+                    var shortfall = receipt.advanceAddedPaise - tenant.advanceBalancePaise
+                    val usedTxs = advanceDao.getAdjustedAdvanceForTenantDesc(tenant.id)
+                    var reclaimed = 0L
+                    for (tx in usedTxs) {
+                        if (shortfall <= 0L) break
+                        val take = minOf(shortfall, tx.amountPaise)
+                        val rentId = tx.rentEntryId
+                        if (rentId != null) {
+                            val rent = rentDao.getRentById(rentId)
+                            if (rent != null) {
+                                val newAdvApplied = (rent.advanceAppliedPaise - take).coerceAtLeast(0L)
+                                val newPending = (rent.rentAmountPaise - newAdvApplied - rent.amountPaidPaise - rent.writeOffPaise).coerceAtLeast(0L)
+                                val newStatus = computeRentStatus(
+                                    rent.rentAmountPaise,
+                                    rent.amountPaidPaise,
+                                    newAdvApplied,
+                                    rent.writeOffPaise,
+                                    newPending
+                                )
+                                rentDao.updateRentEntry(
+                                    rent.copy(
+                                        advanceAppliedPaise = newAdvApplied,
+                                        pendingPaise = newPending,
+                                        status = newStatus
+                                    )
+                                )
+                            }
+                        }
+                        if (take >= tx.amountPaise) {
+                            advanceDao.deleteAdvanceTransactionById(tx.id)
+                        } else {
+                            advanceDao.updateAdvanceTransaction(tx.copy(amountPaise = tx.amountPaise - take))
+                        }
+                        shortfall -= take
+                        reclaimed += take
+                    }
+                    val remainingAdv = (tenant.advanceBalancePaise + reclaimed - receipt.advanceAddedPaise)
+                        .coerceAtLeast(0L)
+                    tenant = tenant.copy(advanceBalancePaise = remainingAdv)
+                    tenantDao.updateTenant(tenant)
+                }
+                advanceDao.deleteAdvanceByPaymentId(paymentId)
+            }
+
+            // 2. Reverse Rent & Electricity allocations
+            for (alloc in allocations) {
+                when (alloc.targetType) {
+                    "RENT" -> {
+                        val rent = alloc.targetId?.let { rentDao.getRentById(it) } ?: continue
+                        val newPaid = (rent.amountPaidPaise - alloc.amountPaise).coerceAtLeast(0L)
+                        val newPending = (rent.rentAmountPaise - newPaid - rent.advanceAppliedPaise - rent.writeOffPaise).coerceAtLeast(0L)
+                        val newStatus = computeRentStatus(
+                            rent.rentAmountPaise,
+                            newPaid,
+                            rent.advanceAppliedPaise,
+                            rent.writeOffPaise,
+                            newPending
+                        )
+                        rentDao.updateRentEntry(
+                            rent.copy(
+                                amountPaidPaise = newPaid,
+                                pendingPaise = newPending,
+                                status = newStatus
+                            )
+                        )
+                    }
+                    "ELECTRICITY" -> {
+                        val bill = alloc.targetId?.let { electricityDao.getBillById(it) } ?: continue
+                        val newPaid = (bill.amountPaidPaise - alloc.amountPaise).coerceAtLeast(0L)
+                        val newPending = (bill.totalBillPaise - newPaid).coerceAtLeast(0L)
+                        val newStatus = computeBillStatus(bill.totalBillPaise, newPaid)
+                        electricityDao.updateBill(
+                            bill.copy(
+                                amountPaidPaise = newPaid,
+                                pendingPaise = newPending,
+                                status = newStatus
+                            )
+                        )
+                    }
+                }
+            }
+
+            paymentDao.deleteAllocationsForPayment(paymentId)
+            paymentDao.deleteReceiptById(paymentId)
+        }
+    }
+
+    // ==================== ADVANCE ADJUSTMENT ====================
+
+    suspend fun applyAdvanceToRent(
+        tenantId: Long,
+        rentEntryId: Long,
+        amountPaise: Long,
+        dateIso: String,
+        remarks: String
+    ): Result<Unit> = runCatching {
+        require(amountPaise > 0L) { "Amount must be greater than zero." }
+        require(DateUtils.isValidIsoDate(dateIso)) { "Invalid date." }
+
+        db.withTransaction {
+            val tenant = tenantDao.getTenantById(tenantId)
+                ?: throw IllegalStateException("Tenant not found.")
+            val rent = rentDao.getRentById(rentEntryId)
+                ?: throw IllegalStateException("Rent entry not found.")
+            require(rent.tenantId == tenantId) { "Rent entry does not belong to this tenant." }
+            require(amountPaise <= tenant.advanceBalancePaise) {
+                "Amount exceeds available advance balance (${MoneyUtils.formatRupees(tenant.advanceBalancePaise)})."
+            }
+            require(amountPaise <= rent.pendingPaise) {
+                "Amount exceeds pending rent (${MoneyUtils.formatRupees(rent.pendingPaise)})."
+            }
+
+            tenantDao.updateTenant(tenant.copy(advanceBalancePaise = tenant.advanceBalancePaise - amountPaise))
+
+            val newAdvApplied = rent.advanceAppliedPaise + amountPaise
+            val newPending = rent.pendingPaise - amountPaise
+            val newStatus = computeRentStatus(
+                rent.rentAmountPaise,
+                rent.amountPaidPaise,
+                newAdvApplied,
+                rent.writeOffPaise,
+                newPending
+            )
+            rentDao.updateRentEntry(
+                rent.copy(
+                    advanceAppliedPaise = newAdvApplied,
+                    pendingPaise = newPending,
+                    status = newStatus
+                )
+            )
+            advanceDao.insertAdvanceTransaction(
+                AdvanceTransactionEntity(
+                    tenantId = tenantId,
+                    type = "ADJUSTED_TO_RENT",
+                    amountPaise = amountPaise,
+                    rentEntryId = rentEntryId,
+                    transactionDate = dateIso,
+                    remarks = remarks.trim().ifEmpty { "Applied to ${DateUtils.formatMonthYear(rent.rentMonth)} rent" }
+                )
+            )
+        }
+    }
+
+    // ==================== ELECTRICITY BILLS ====================
+
+    suspend fun addElectricityBill(
+        roomNumber: Int,
+        tenantId: Long?,
+        periodFrom: String,
+        periodTo: String,
+        previousReading: Double,
+        currentReading: Double,
+        ratePerUnitPaise: Long
+    ): Result<Long> = runCatching {
+        validateElectricityInputs(periodFrom, periodTo, previousReading, currentReading, ratePerUnitPaise)
+
+        db.withTransaction {
+            val room = roomDao.getRoom(roomNumber)
+                ?: throw IllegalStateException("Room $roomNumber not found.")
+            val resolvedTenantId = tenantId ?: room.currentTenantId
+                ?: throw IllegalStateException("Room $roomNumber is vacant. Select a tenant or allot the room first.")
+
+            ensureNoBillOverlapLocked(roomNumber, periodFrom, periodTo, excludeBillId = null)
+
+            val units = currentReading - previousReading
+            val totalPaise = MoneyUtils.calculateBillPaise(units, ratePerUnitPaise)
+
+            val billId = electricityDao.insertBill(
+                ElectricityBillEntity(
+                    roomNumber = roomNumber,
+                    tenantId = resolvedTenantId,
+                    periodFrom = periodFrom,
+                    periodTo = periodTo,
+                    previousReading = previousReading,
+                    currentReading = currentReading,
+                    unitsConsumed = units,
+                    ratePerUnitPaise = ratePerUnitPaise,
+                    totalBillPaise = totalPaise,
+                    amountPaidPaise = 0L,
+                    pendingPaise = totalPaise,
+                    status = if (totalPaise == 0L) "PAID" else "PENDING"
+                )
+            )
+
+            recomputeRoomLastMeterReadingLocked(roomNumber)
+
+            val settings = settingsDao.getSettings() ?: AppSettingsEntity()
+            if (settings.defaultElectricityRatePaise != ratePerUnitPaise) {
+                settingsDao.upsertSettings(settings.copy(defaultElectricityRatePaise = ratePerUnitPaise))
+            }
+            billId
+        }
+    }
+
+    suspend fun editElectricityBill(
+        billId: Long,
+        periodFrom: String,
+        periodTo: String,
+        previousReading: Double,
+        currentReading: Double,
+        ratePerUnitPaise: Long
+    ): Result<Unit> = runCatching {
+        validateElectricityInputs(periodFrom, periodTo, previousReading, currentReading, ratePerUnitPaise)
+
+        db.withTransaction {
+            val existing = electricityDao.getBillById(billId)
+                ?: throw IllegalStateException("Electricity bill not found.")
+            ensureNoBillOverlapLocked(existing.roomNumber, periodFrom, periodTo, excludeBillId = billId)
+
+            val units = currentReading - previousReading
+            val newTotalPaise = MoneyUtils.calculateBillPaise(units, ratePerUnitPaise)
+
+            if (newTotalPaise >= existing.amountPaidPaise) {
+                val newPending = newTotalPaise - existing.amountPaidPaise
+                val newStatus = computeBillStatus(newTotalPaise, existing.amountPaidPaise)
+                electricityDao.updateBill(
+                    existing.copy(
+                        periodFrom = periodFrom,
+                        periodTo = periodTo,
+                        previousReading = previousReading,
+                        currentReading = currentReading,
+                        unitsConsumed = units,
+                        ratePerUnitPaise = ratePerUnitPaise,
+                        totalBillPaise = newTotalPaise,
+                        pendingPaise = newPending,
+                        status = newStatus
+                    )
+                )
+            } else {
+                // Reconcile excess previously paid against this bill
+                var excess = existing.amountPaidPaise - newTotalPaise
+                electricityDao.updateBill(
+                    existing.copy(
+                        periodFrom = periodFrom,
+                        periodTo = periodTo,
+                        previousReading = previousReading,
+                        currentReading = currentReading,
+                        unitsConsumed = units,
+                        ratePerUnitPaise = ratePerUnitPaise,
+                        totalBillPaise = newTotalPaise,
+                        amountPaidPaise = newTotalPaise,
+                        pendingPaise = 0L,
+                        status = "PAID"
+                    )
+                )
+
+                val allocs = paymentDao.getAllocationsForTargetDesc("ELECTRICITY", billId)
+                for (alloc in allocs) {
+                    if (excess <= 0L) break
+                    val take = minOf(excess, alloc.amountPaise)
+                    val receipt = paymentDao.getReceiptById(alloc.paymentId) ?: continue
+                    var tenant = tenantDao.getTenantById(alloc.tenantId) ?: continue
+
+                    if (take >= alloc.amountPaise) {
+                        paymentDao.deleteAllocationById(alloc.id)
+                    } else {
+                        paymentDao.updateAllocation(alloc.copy(amountPaise = alloc.amountPaise - take))
+                    }
+
+                    // Reallocate freed amount: Priority 1 Rent -> Priority 2 other Electricity -> Priority 3 Advance
+                    var freed = take
+                    var addRent = 0L
+                    var addElec = 0L
+                    var addAdv = 0L
+
+                    val otherRents = rentDao.getPendingRentForTenantAsc(tenant.id)
+                    for (r in otherRents) {
+                        if (freed <= 0L) break
+                        val a = minOf(freed, r.pendingPaise)
+                        if (a > 0L) {
+                            val nPaid = r.amountPaidPaise + a
+                            val nPend = r.pendingPaise - a
+                            rentDao.updateRentEntry(
+                                r.copy(
+                                    amountPaidPaise = nPaid,
+                                    pendingPaise = nPend,
+                                    status = computeRentStatus(r.rentAmountPaise, nPaid, r.advanceAppliedPaise, r.writeOffPaise, nPend)
+                                )
+                            )
+                            paymentDao.insertAllocation(
+                                PaymentAllocationEntity(
+                                    paymentId = receipt.id,
+                                    tenantId = tenant.id,
+                                    targetType = "RENT",
+                                    targetId = r.id,
+                                    amountPaise = a
+                                )
+                            )
+                            freed -= a
+                            addRent += a
+                        }
+                    }
+
+                    if (freed > 0L) {
+                        val otherBills = electricityDao.getPendingBillsForTenantAsc(tenant.id)
+                            .filter { it.id != billId }
+                        for (b in otherBills) {
+                            if (freed <= 0L) break
+                            val a = minOf(freed, b.pendingPaise)
+                            if (a > 0L) {
+                                val nPaid = b.amountPaidPaise + a
+                                val nPend = b.pendingPaise - a
+                                electricityDao.updateBill(
+                                    b.copy(
+                                        amountPaidPaise = nPaid,
+                                        pendingPaise = nPend,
+                                        status = computeBillStatus(b.totalBillPaise, nPaid)
+                                    )
+                                )
+                                paymentDao.insertAllocation(
+                                    PaymentAllocationEntity(
+                                        paymentId = receipt.id,
+                                        tenantId = tenant.id,
+                                        targetType = "ELECTRICITY",
+                                        targetId = b.id,
+                                        amountPaise = a
+                                    )
+                                )
+                                freed -= a
+                                addElec += a
+                            }
+                        }
+                    }
+
+                    if (freed > 0L) {
+                        addAdv = freed
+                        tenant = tenant.copy(advanceBalancePaise = tenant.advanceBalancePaise + addAdv)
+                        tenantDao.updateTenant(tenant)
+                        val advId = advanceDao.insertAdvanceTransaction(
+                            AdvanceTransactionEntity(
+                                tenantId = tenant.id,
+                                type = "ADDED_FROM_PAYMENT",
+                                amountPaise = addAdv,
+                                paymentId = receipt.id,
+                                transactionDate = receipt.paymentDate,
+                                remarks = "Reconciled after electricity bill edit (${receipt.receiptNumber})"
+                            )
+                        )
+                        paymentDao.insertAllocation(
+                            PaymentAllocationEntity(
+                                paymentId = receipt.id,
+                                tenantId = tenant.id,
+                                targetType = "ADVANCE",
+                                targetId = advId,
+                                amountPaise = addAdv
+                            )
+                        )
+                    }
+
+                    paymentDao.updateReceipt(
+                        receipt.copy(
+                            rentAdjustedPaise = receipt.rentAdjustedPaise + addRent,
+                            electricityAdjustedPaise = (receipt.electricityAdjustedPaise - take + addElec).coerceAtLeast(0L),
+                            advanceAddedPaise = receipt.advanceAddedPaise + addAdv
+                        )
+                    )
+                    excess -= take
+                }
+            }
+
+            recomputeRoomLastMeterReadingLocked(existing.roomNumber)
+            val settings = settingsDao.getSettings() ?: AppSettingsEntity()
+            if (settings.defaultElectricityRatePaise != ratePerUnitPaise) {
+                settingsDao.upsertSettings(settings.copy(defaultElectricityRatePaise = ratePerUnitPaise))
+            }
+        }
+    }
+
+    suspend fun deleteElectricityBill(billId: Long): Result<Unit> = runCatching {
+        db.withTransaction {
+            val existing = electricityDao.getBillById(billId)
+                ?: throw IllegalStateException("Electricity bill not found.")
+            if (existing.amountPaidPaise > 0L) {
+                throw IllegalStateException(
+                    "Cannot delete a paid or partially paid electricity bill (${MoneyUtils.formatRupees(existing.amountPaidPaise)} paid). Delete the linked payment receipt first."
+                )
+            }
+            electricityDao.deleteBillById(billId)
+            recomputeRoomLastMeterReadingLocked(existing.roomNumber)
+        }
+    }
+
+    private fun validateElectricityInputs(
+        periodFrom: String,
+        periodTo: String,
+        previousReading: Double,
+        currentReading: Double,
+        ratePerUnitPaise: Long
+    ) {
+        val from = DateUtils.parseIsoDate(periodFrom)
+            ?: throw IllegalArgumentException("Invalid Billing Period From date.")
+        val to = DateUtils.parseIsoDate(periodTo)
+            ?: throw IllegalArgumentException("Invalid Billing Period To date.")
+        require(to >= from) { "Billing Period To must be on or after Billing Period From." }
+        require(previousReading >= 0.0) { "Previous reading cannot be negative." }
+        require(currentReading >= previousReading) {
+            "Current meter reading cannot be less than previous reading (negative units not allowed)."
+        }
+        require(ratePerUnitPaise >= 0L) { "Rate per unit cannot be negative." }
+    }
+
+    private suspend fun ensureNoBillOverlapLocked(
+        roomNumber: Int,
+        periodFrom: String,
+        periodTo: String,
+        excludeBillId: Long?
+    ) {
+        val newFrom = DateUtils.parseIsoDate(periodFrom)!!
+        val newTo = DateUtils.parseIsoDate(periodTo)!!
+        val bills = electricityDao.getBillsForRoomDesc(roomNumber)
+        for (bill in bills) {
+            if (excludeBillId != null && bill.id == excludeBillId) continue
+            val exFrom = DateUtils.parseIsoDate(bill.periodFrom) ?: continue
+            val exTo = DateUtils.parseIsoDate(bill.periodTo) ?: continue
+            val overlaps = (newFrom < exTo && newTo > exFrom) || (newFrom == exFrom && newTo == exTo)
+            if (overlaps) {
+                throw IllegalArgumentException(
+                    "Billing period overlaps with existing bill (${DateUtils.formatDisplayDate(bill.periodFrom)} - ${DateUtils.formatDisplayDate(bill.periodTo)}) for Room $roomNumber."
+                )
+            }
+        }
+    }
+
+    private suspend fun recomputeRoomLastMeterReadingLocked(roomNumber: Int) {
+        val room = roomDao.getRoom(roomNumber) ?: return
+        val bills = electricityDao.getBillsForRoomDesc(roomNumber)
+        val maxReading = bills.maxOfOrNull { it.currentReading } ?: 0.0
+        roomDao.updateRoom(room.copy(lastMeterReading = maxReading))
+    }
+
+    // ==================== WRITE-OFFS ====================
+
+    suspend fun writeOffRent(
+        rentEntryId: Long,
+        amountPaise: Long,
+        writeOffDate: String,
+        remarks: String
+    ): Result<Long> = runCatching {
+        require(amountPaise > 0L) { "Write-off amount must be greater than zero." }
+        require(DateUtils.isValidIsoDate(writeOffDate)) { "Invalid write-off date." }
+
+        db.withTransaction {
+            val rent = rentDao.getRentById(rentEntryId)
+                ?: throw IllegalStateException("Rent entry not found.")
+            require(amountPaise <= rent.pendingPaise) {
+                "Write-off cannot exceed outstanding rent (${MoneyUtils.formatRupees(rent.pendingPaise)})."
+            }
+
+            val newWriteOff = rent.writeOffPaise + amountPaise
+            val newPending = rent.pendingPaise - amountPaise
+            val newStatus = computeRentStatus(
+                rent.rentAmountPaise,
+                rent.amountPaidPaise,
+                rent.advanceAppliedPaise,
+                newWriteOff,
+                newPending
+            )
+            rentDao.updateRentEntry(
+                rent.copy(
+                    writeOffPaise = newWriteOff,
+                    pendingPaise = newPending,
+                    status = newStatus
+                )
+            )
+            writeOffDao.insertWriteOff(
+                WriteOffEntity(
+                    tenantId = rent.tenantId,
+                    rentEntryId = rent.id,
+                    amountPaise = amountPaise,
+                    writeOffDate = writeOffDate,
+                    remarks = remarks.trim(),
+                    isReversed = false
+                )
+            )
+        }
+    }
+
+    suspend fun undoWriteOff(
+        writeOffId: Long,
+        reversedDate: String = DateUtils.todayIso()
+    ): Result<Unit> = runCatching {
+        db.withTransaction {
+            val wo = writeOffDao.getWriteOffById(writeOffId)
+                ?: throw IllegalStateException("Write-off record not found.")
+            require(!wo.isReversed) { "Write-off has already been reversed." }
+
+            val rent = rentDao.getRentById(wo.rentEntryId)
+                ?: throw IllegalStateException("Linked rent entry not found.")
+
+            val newWriteOff = (rent.writeOffPaise - wo.amountPaise).coerceAtLeast(0L)
+            val newPending = (rent.rentAmountPaise - rent.amountPaidPaise - rent.advanceAppliedPaise - newWriteOff)
+                .coerceAtLeast(0L)
+            val newStatus = computeRentStatus(
+                rent.rentAmountPaise,
+                rent.amountPaidPaise,
+                rent.advanceAppliedPaise,
+                newWriteOff,
+                newPending
+            )
+            rentDao.updateRentEntry(
+                rent.copy(
+                    writeOffPaise = newWriteOff,
+                    pendingPaise = newPending,
+                    status = newStatus
+                )
+            )
+            writeOffDao.updateWriteOff(
+                wo.copy(
+                    isReversed = true,
+                    reversedDate = reversedDate
+                )
+            )
+        }
+    }
+
+    // ==================== FOLLOW-UPS ====================
+
+    suspend fun addFollowUp(
+        tenantId: Long,
+        followUpDate: String,
+        promisedPaymentDate: String,
+        pendingAmountPaise: Long,
+        remarks: String
+    ): Result<Long> = runCatching {
+        require(DateUtils.isValidIsoDate(followUpDate)) { "Invalid follow-up date." }
+        require(DateUtils.isValidIsoDate(promisedPaymentDate)) { "Invalid promised payment date." }
+
+        db.withTransaction {
+            val tenant = tenantDao.getTenantById(tenantId)
+                ?: throw IllegalStateException("Tenant not found.")
+            followUpDao.insertFollowUp(
+                FollowUpEntity(
+                    tenantId = tenantId,
+                    roomNumber = tenant.currentRoomNumber,
+                    followUpDate = followUpDate,
+                    promisedPaymentDate = promisedPaymentDate,
+                    pendingAmountPaise = pendingAmountPaise.coerceAtLeast(0L),
+                    remarks = remarks.trim(),
+                    status = "PENDING"
+                )
+            )
+        }
+    }
+
+    suspend fun editFollowUp(
+        followUpId: Long,
+        followUpDate: String,
+        promisedPaymentDate: String,
+        pendingAmountPaise: Long,
+        remarks: String
+    ): Result<Unit> = runCatching {
+        require(DateUtils.isValidIsoDate(followUpDate)) { "Invalid follow-up date." }
+        require(DateUtils.isValidIsoDate(promisedPaymentDate)) { "Invalid promised payment date." }
+
+        db.withTransaction {
+            val existing = followUpDao.getFollowUpById(followUpId)
+                ?: throw IllegalStateException("Follow-up not found.")
+            followUpDao.updateFollowUp(
+                existing.copy(
+                    followUpDate = followUpDate,
+                    promisedPaymentDate = promisedPaymentDate,
+                    pendingAmountPaise = pendingAmountPaise.coerceAtLeast(0L),
+                    remarks = remarks.trim()
+                )
+            )
+        }
+    }
+
+    suspend fun markFollowUpCompleted(
+        followUpId: Long,
+        completedDate: String = DateUtils.todayIso()
+    ): Result<Unit> = runCatching {
+        db.withTransaction {
+            val existing = followUpDao.getFollowUpById(followUpId)
+                ?: throw IllegalStateException("Follow-up not found.")
+            followUpDao.updateFollowUp(
+                existing.copy(
+                    status = "COMPLETED",
+                    completedDate = completedDate
+                )
+            )
+        }
+    }
+
+    suspend fun reopenFollowUp(followUpId: Long): Result<Unit> = runCatching {
+        db.withTransaction {
+            val existing = followUpDao.getFollowUpById(followUpId)
+                ?: throw IllegalStateException("Follow-up not found.")
+            followUpDao.updateFollowUp(
+                existing.copy(
+                    status = "PENDING",
+                    completedDate = null
+                )
+            )
+        }
+    }
+
+    suspend fun deleteFollowUp(followUpId: Long): Result<Unit> = runCatching {
+        db.withTransaction {
+            followUpDao.deleteFollowUpById(followUpId)
+        }
+    }
+
+    // ==================== SETTINGS, BACKUP & RESTORE ====================
+
+    suspend fun updateSettings(
+        defaultElectricityRatePaise: Long,
+        backupReminderDays: Int
+    ): Result<Unit> = runCatching {
+        require(defaultElectricityRatePaise >= 0L) { "Rate cannot be negative." }
+        require(backupReminderDays >= 1) { "Reminder interval must be at least 1 day." }
+        db.withTransaction {
+            val current = settingsDao.getSettings() ?: AppSettingsEntity()
+            settingsDao.upsertSettings(
+                current.copy(
+                    defaultElectricityRatePaise = defaultElectricityRatePaise,
+                    backupReminderDays = backupReminderDays
+                )
+            )
+        }
+    }
+
+    suspend fun exportBackupJson(markBackupCompleted: Boolean = true): Result<String> = runCatching {
+        val nowMs = System.currentTimeMillis()
+        val payload = db.withTransaction {
+            val settings = settingsDao.getSettings() ?: AppSettingsEntity()
+            val updatedSettings = if (markBackupCompleted) {
+                settings.copy(lastBackupEpochMs = nowMs).also { settingsDao.upsertSettings(it) }
+            } else {
+                settings
+            }
+            BackupPayload(
+                backupVersion = BackupHelper.CURRENT_BACKUP_VERSION,
+                exportedAtEpochMs = nowMs,
+                exportedAtIso = DateUtils.todayIso(),
+                appSettings = updatedSettings,
+                rooms = roomDao.getAllRooms(),
+                tenants = tenantDao.getAllTenants(),
+                rentEntries = rentDao.getAllRentEntries(),
+                suppressedRentCycles = rentDao.getAllSuppressedCycles(),
+                electricityBills = electricityDao.getAllBills(),
+                paymentReceipts = paymentDao.getAllReceipts(),
+                paymentAllocations = paymentDao.getAllAllocations(),
+                advanceTransactions = advanceDao.getAllAdvanceTransactions(),
+                writeOffs = writeOffDao.getAllWriteOffs(),
+                followUps = followUpDao.getAllFollowUps(),
+                roomTransfers = transferDao.getAllTransfers()
+            )
+        }
+        BackupHelper.serialize(payload)
+    }
+
+    suspend fun validateBackupJson(jsonString: String): Result<BackupPayload> =
+        BackupHelper.parseAndValidate(jsonString)
+
+    suspend fun restoreBackupPayload(payload: BackupPayload): Result<Unit> = runCatching {
+        db.withTransaction {
+            // Clear existing tables cleanly
+            paymentDao.deleteAllAllocations()
+            paymentDao.deleteAllReceipts()
+            advanceDao.deleteAllAdvanceTransactions()
+            writeOffDao.deleteAllWriteOffs()
+            followUpDao.deleteAllFollowUps()
+            transferDao.deleteAllTransfers()
+            electricityDao.deleteAllBills()
+            rentDao.deleteAllSuppressedCycles()
+            rentDao.deleteAllRentEntries()
+            tenantDao.deleteAllTenants()
+            roomDao.resetAllRooms()
+
+            // Restore in dependency order preserving exact IDs
+            settingsDao.upsertSettings(payload.appSettings.copy(lastBackupEpochMs = System.currentTimeMillis()))
+            roomDao.insertRoomsReplace(payload.rooms)
+            tenantDao.insertTenantsReplace(payload.tenants)
+            rentDao.insertRentEntriesReplace(payload.rentEntries)
+            rentDao.insertSuppressedCyclesReplace(payload.suppressedRentCycles)
+            electricityDao.insertBillsReplace(payload.electricityBills)
+            paymentDao.insertReceiptsReplace(payload.paymentReceipts)
+            paymentDao.insertAllocationsReplace(payload.paymentAllocations)
+            advanceDao.insertAdvanceTransactionsReplace(payload.advanceTransactions)
+            writeOffDao.insertWriteOffsReplace(payload.writeOffs)
+            followUpDao.insertFollowUpsReplace(payload.followUps)
+            transferDao.insertTransfersReplace(payload.roomTransfers)
+        }
+    }
+
+    suspend fun deleteAllApplicationData(): Result<List<String>> = runCatching {
+        db.withTransaction {
+            val kycPaths = tenantDao.getAllTenants().mapNotNull { it.kycDocumentPath }
+            paymentDao.deleteAllAllocations()
+            paymentDao.deleteAllReceipts()
+            advanceDao.deleteAllAdvanceTransactions()
+            writeOffDao.deleteAllWriteOffs()
+            followUpDao.deleteAllFollowUps()
+            transferDao.deleteAllTransfers()
+            electricityDao.deleteAllBills()
+            rentDao.deleteAllSuppressedCycles()
+            rentDao.deleteAllRentEntries()
+            tenantDao.deleteAllTenants()
+            roomDao.resetAllRooms()
+            val seeds = (1..AppDatabase.TOTAL_ROOMS).map { RoomEntity(roomNumber = it) }
+            roomDao.insertRoomsIgnore(seeds)
+            val currentSettings = settingsDao.getSettings() ?: AppSettingsEntity()
+            settingsDao.upsertSettings(currentSettings.copy(nextReceiptSeq = 1))
+            kycPaths
+        }
+    }
+
+    // ==================== HELPERS ====================
+
+    private fun formatReceiptNumber(year: Int, seq: Int): String =
+        String.format(Locale.US, "RRR-%04d-%04d", year, seq)
+
+    private fun computeRentStatus(
+        rentAmountPaise: Long,
+        amountPaidPaise: Long,
+        advanceAppliedPaise: Long,
+        writeOffPaise: Long,
+        pendingPaise: Long
+    ): String {
+        if (pendingPaise <= 0L) {
+            return if (writeOffPaise > 0L && amountPaidPaise == 0L && advanceAppliedPaise == 0L) {
+                "WRITTEN_OFF"
+            } else {
+                "PAID"
+            }
+        }
+        return if (amountPaidPaise > 0L || advanceAppliedPaise > 0L || writeOffPaise > 0L) {
+            "PARTIAL"
+        } else {
+            "PENDING"
+        }
+    }
+
+    private fun computeBillStatus(totalBillPaise: Long, amountPaidPaise: Long): String {
+        if (amountPaidPaise >= totalBillPaise) return "PAID"
+        return if (amountPaidPaise > 0L) "PARTIAL" else "PENDING"
+    }
+}
